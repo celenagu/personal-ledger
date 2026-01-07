@@ -1,2 +1,2 @@
-# txn-prettifier
+# personal-ledger
 easier on the eyes
