@@ -2,105 +2,126 @@
 
 from pathlib import Path
 import os
+import json
 import pandas as pd
-from functools import cmp_to_key
-from formatter import format_csv, format_to_df
-# from sheets_uploader import SheetsUploader
+from formatter import (
+    add_overall_total,
+    attach_overall_total,
+    dedupe_new_rows,
+    merge_input_files,
+    normalize_date_series,
+    normalize_history_df,
+    sort_transactions,
+)
+from categorizer import (
+    apply_merchant_map,
+    apply_tfidf_classifier,
+    update_merchant_map_from_history,
+)
+from sheets_uploader import SheetsUploader
+
+
+def _read_gsheets_config(path="secrets/gsheets_config.json"):
+    config_path = Path(path)
+    if not config_path.exists():
+        return {}
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _truthy(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _config_enabled(config, key):
+    return _truthy(config.get(key))
+
+
+def _env_enabled(name):
+    return os.getenv(name) == "1"
 
 def main():
     out_file = "files/formatted.csv"
 
-    # Merge chequing/savings/credit if present
-    candidates = [
-        "files/chequing.csv",
-        "files/savings.csv",
-        "files/credit.csv",
-    ]
-    existing = [p for p in candidates if Path(p).exists()]
+    new_df = merge_input_files()
 
-    if existing:
-        frames = []
-        for p in existing:
-            df = format_to_df(p).copy()
-            df["Source"] = Path(p).name
-            df["OrigOrder"] = range(len(df))
-            frames.append(df)
-        new_df = pd.concat(frames, ignore_index=True)
+
+    config = _read_gsheets_config()
+    sync_enabled = _env_enabled("SHEETS_SYNC") or _config_enabled(config, "sync_enabled")
+    history_enabled = _env_enabled("SHEETS_HISTORY") or _config_enabled(config, "history_enabled") or sync_enabled
+    sheets_history = None
+    if history_enabled:
+        sheets_history = SheetsUploader().read_sheet()
+        sheets_history = normalize_history_df(sheets_history)
+        if sheets_history is not None and sheets_history.empty:
+            sheets_history = None
+
+    if sheets_history is None:
+        update_merchant_map_from_history()
     else:
-        in_file = "files/input.csv"
-        new_df = format_to_df(in_file)
-        new_df["Source"] = Path(in_file).name
-        new_df["OrigOrder"] = range(len(new_df))
+        update_merchant_map_from_history(history_df=sheets_history)
+
+    new_df = apply_merchant_map(new_df)
+    min_sim = float(os.getenv("TFIDF_MIN_SIM", "0.35"))
+    new_df = apply_tfidf_classifier(
+        new_df,
+        min_similarity=min_sim,
+        history_df=sheets_history,
+    )
 
     # Append-only master with duplicate handling
-    # Keep existing rows; from the new batch, add only the surplus copies beyond what is already in master
-    if Path(out_file).exists():
-        master_df = pd.read_csv(out_file)
-        master_df["Source"] = "master"
-        master_df["OrigOrder"] = range(len(master_df))
-        # Identity keys: Date, Name, Type, SignedAmount
-        def with_signed_amount(df):
-            d = df.copy()
-            d["Out"] = pd.to_numeric(d["Out"], errors="coerce")
-            d["In"] = pd.to_numeric(d["In"], errors="coerce")
-            d["SignedAmount"] = (d["In"].fillna(0) - d["Out"].fillna(0)).round(2)
-            return d
+    master_df = None
+    if sheets_history is not None:
+        master_df = sheets_history.copy()
+    elif Path(out_file).exists():
+        try:
+            master_df = pd.read_csv(out_file)
+        except pd.errors.EmptyDataError:
+            master_df = None
 
-        master_k = with_signed_amount(master_df)
-        new_k = with_signed_amount(new_df)
+    combined, new_only = dedupe_new_rows(new_df, master_df)
 
-        keys = ["Date", "Name", "Type", "SignedAmount"]
-
-        # Count occurrences in master for each key
-        master_counts = (
-            master_k.groupby(keys).size().rename("count_master").reset_index()
-        )
-        # For each new row, compute its position within identical-key rows 
-        tmp = new_k.copy()
-        tmp["_dup_index"] = tmp.groupby(keys).cumcount()
-        tmp = tmp.merge(master_counts, on=keys, how="left")
-        tmp["count_master"] = tmp["count_master"].fillna(0).astype(int)
-        # Keep only the rows whose index exceeds existing count in master
-        new_only_k = tmp[tmp["_dup_index"] >= tmp["count_master"]].drop(columns=["_dup_index", "count_master"]) 
-        # Remove helper column
-        new_only = new_only_k.drop(columns=["SignedAmount"], errors="ignore")
-        if os.getenv("TXN_DEBUG"):
-            skipped = len(new_df) - len(new_only)
-            print(f"DEBUG: new={len(new_df)} added={len(new_only)} skipped_as_existing={skipped}")
-        combined = pd.concat([master_df, new_only], ignore_index=True)
+    combined_sorted = sort_transactions(combined)
+    combined_sorted = add_overall_total(combined_sorted)
+    combined_out = combined_sorted.drop(columns=["Source", "OrigOrder"], errors="ignore")
+    new_only_sorted = sort_transactions(new_only)
+    new_only_sorted = attach_overall_total(new_only_sorted, combined_sorted)
+    new_only_out = new_only_sorted.drop(columns=["Source", "OrigOrder"], errors="ignore")
+    if "Date" in combined_out.columns:
+        combined_out["Date"] = normalize_date_series(combined_out["Date"])
+    if "Date" in new_only_out.columns:
+        new_only_out["Date"] = normalize_date_series(new_only_out["Date"])
+    if sync_enabled:
+        uploader = SheetsUploader()
+        upload_mode = uploader.get_mode()
+        if upload_mode == "append":
+            if not new_only_out.empty:
+                uploader.upload_df(new_only_out)
+                print("Uploaded to Google Sheets")
+            else:
+                print("No new rows to append")
+        else:
+            uploader.upload_df(combined_out)
+            print("Uploaded to Google Sheets")
     else:
-        combined = new_df
+        print("Merged and saved to:", out_file)
 
 
-    # - Primary: Date ascending
-    # - Tie: if same Source, keep original row order (OrigOrder) otherwise order by Name ascending
-    def _cmp(a, b):
-        if a["Date"] != b["Date"]:
-            return -1 if a["Date"] < b["Date"] else 1
-        if a["Source"] == b["Source"]:
-            if a["OrigOrder"] == b["OrigOrder"]:
-                return 0
-            return -1 if a["OrigOrder"] < b["OrigOrder"] else 1
-        # Different sources on same date: order by Name
-        an, bn = str(a["Name"]), str(b["Name"]) 
-        if an == bn:
-            # Fallback 
-            return -1 if a["Source"] < b["Source"] else 1
-        return -1 if an < bn else 1
-
-    records = combined.to_dict("records")
-    records_sorted = sorted(records, key=cmp_to_key(_cmp))
-    combined_sorted = pd.DataFrame.from_records(records_sorted, columns=combined.columns)
-    combined_sorted = combined_sorted.drop(columns=["Source", "OrigOrder"], errors="ignore")
-    combined_sorted.to_csv(out_file, index=False)
-    print("Merged and saved to:", out_file)
-    # upload_csv_to_sheets(out_file, "Jan 2025 Report")
-
-if __name__ == "__main__":                                                
-    import traceback, sys                                                 
-    try:                                                                  
-        main()                                                            
-    except Exception:                                                     
-        traceback.print_exc()                                             
-        input("Error occurred. Press Enter to exit...")                   
-        sys.exit(1)      
+if __name__ == "__main__":
+    import traceback, sys
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        input("Error occurred. Press Enter to exit...")
+        sys.exit(1)
