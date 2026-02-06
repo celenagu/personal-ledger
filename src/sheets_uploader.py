@@ -120,6 +120,7 @@ class SheetsUploader:
         config = _load_config(self.config_path)
         return config.get("mode", "append").lower()
 
+# upload DataFrame to Google Sheets with append or overwrite mode
     def upload_df(self, df):
         config = _load_config(self.config_path)
         spreadsheet_id = config.get("spreadsheet_id")

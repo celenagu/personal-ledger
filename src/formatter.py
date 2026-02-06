@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 from functools import cmp_to_key
 
-
+# Infer account type from filename
 def infer_type_from_name(in_file):
     name = Path(in_file).name.lower()
     if "chequing" in name:
@@ -15,13 +15,16 @@ def infer_type_from_name(in_file):
         return "Credit"
     return "Uncategorized"
 
-
+# Format CSV to standardized DataFrame
 def format_to_df(in_file):
+    # Read CSV without header
     df = pd.read_csv(in_file, header=None)
     account_type = infer_type_from_name(in_file)
 
+    # Drop completely empty rows
     df = df.dropna(how="all")
 
+    # Standardize to 5 columns: Date, Name, Out, In, Total
     df.columns = ["Date", "Name", "Out", "In", "Total"]
 
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
@@ -35,7 +38,7 @@ def format_to_df(in_file):
     df.insert(0, "Category", "Uncategorized")
     return df
 
-
+# Merge multiple input files into a single DataFrame
 def merge_input_files(
     candidates=None,
     default_file="files/input/input.csv",
@@ -48,6 +51,7 @@ def merge_input_files(
         ]
     existing = [p for p in candidates if Path(p).exists()]
 
+    # If multiple files exist, merge them
     if existing:
         frames = []
         for p in existing:
@@ -62,7 +66,7 @@ def merge_input_files(
     df["OrigOrder"] = range(len(df))
     return df
 
-
+# Convert series to numeric, handling common formatting issues
 def to_num(series):
     if series is None:
         return pd.Series(dtype=float)
@@ -74,7 +78,7 @@ def to_num(series):
     )
     return pd.to_numeric(cleaned, errors="coerce")
 
-
+# Normalize date series, handling various formats including Excel serial dates
 def normalize_date_series(series):
     raw = series.astype(str).str.strip()
     parsed = pd.to_datetime(series, errors="coerce")
@@ -92,7 +96,7 @@ def normalize_date_series(series):
     formatted = formatted.where(parsed.notna(), raw)
     return formatted
 
-
+# Normalize history DataFrame columns
 def normalize_history_df(df):
     if df is None or df.empty:
         return df
@@ -130,7 +134,7 @@ def normalize_history_df(df):
         df["Type"] = df["Type"].astype(str).str.strip()
     return df
 
-
+# Add OverallTotal column based on account types
 def add_overall_total(df):
     if df is None or df.empty or "Type" not in df.columns:
         return df
@@ -154,7 +158,7 @@ def add_overall_total(df):
     df["OverallTotal"] = overall_totals
     return df
 
-
+# Attach OverallTotal to new_only_df from combined_sorted
 def attach_overall_total(new_only_df, combined_sorted):
     if (
         new_only_df is None
@@ -170,13 +174,13 @@ def attach_overall_total(new_only_df, combined_sorted):
         how="left",
     )
 
-
+# Format input CSV and save to output CSV
 def format_csv(in_file, out_file):
     df = format_to_df(in_file)
     df.to_csv(out_file, index=False)
     print("Formatted and saved to:", out_file)
 
-
+# Sort transactions by Date, then by Source and Name
 def sort_transactions(df):
     # - Primary: Date ascending
     # - Tie: if same source, keep original row order (OrigOrder) otherwise order by Name ascending
@@ -196,7 +200,7 @@ def sort_transactions(df):
     records_sorted = sorted(records, key=cmp_to_key(_cmp))
     return pd.DataFrame.from_records(records_sorted, columns=df.columns)
 
-
+# Deduplicate new rows against master DataFrame
 def dedupe_new_rows(new_df, master_df):
     new_only = new_df
     if master_df is None:

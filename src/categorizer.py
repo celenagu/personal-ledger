@@ -22,7 +22,7 @@ _GENERIC_TOKENS = {
     "txn",
 }
 
-
+# Normalize merchant name for matching
 def _normalize_merchant(value):
     if value is None:
         return ""
@@ -34,7 +34,7 @@ def _normalize_merchant(value):
     tokens = [tok for tok in text.split(" ") if tok and tok not in _GENERIC_TOKENS]
     return " ".join(tokens).strip()
 
-
+# Load merchant mapping rules from CSV
 def _load_merchant_map(map_path):
     path = Path(map_path)
     if not path.exists():
@@ -57,7 +57,7 @@ def _load_merchant_map(map_path):
         out.append({"merchant": merchant, "category": category})
     return out
 
-
+# Apply merchant mapping rules to DataFrame
 def apply_merchant_map(
     df,
     map_path="files/rules/merchant_map.csv",
@@ -66,13 +66,15 @@ def apply_merchant_map(
 ):
     merchant_rules = _load_merchant_map(map_path)
     if not merchant_rules:
-        return df
+        return df          # no rules to apply, return original DataFrame
 
     out_df = df.copy()
-    categories = out_df[category_col].fillna("").astype(str).str.strip()
-    needs_category = categories.eq("") | categories.str.lower().eq("uncategorized")
-    normalized_names = out_df[name_col].astype(str).map(_normalize_merchant)
+    categories = out_df[category_col].fillna("").astype(str).str.strip()            # existing categories
+    needs_category = categories.eq("") | categories.str.lower().eq("uncategorized") # rows needing categorization (current blank or "Uncategorized")
+    normalized_names = out_df[name_col].astype(str).map(_normalize_merchant)        # normalized merchant names
 
+    # Apply rules to rows needing categorization
+    # basic substring match on normalized names
     for idx in out_df.index[needs_category]:
         name = normalized_names.at[idx]
         for rule in merchant_rules:
@@ -81,7 +83,7 @@ def apply_merchant_map(
                 break
     return out_df
 
-
+# Update merchant mapping rules from history DataFrame
 def update_merchant_map_from_history(
     history_path="files/formatted.csv",
     map_path="files/rules/merchant_map.csv",
@@ -155,7 +157,7 @@ def update_merchant_map_from_history(
         out_df = pd.concat([existing, out_df], ignore_index=True)
     out_df.to_csv(path, index=False)
 
-
+# Apply TF-IDF classifier to categorize transactions
 def apply_tfidf_classifier(
     df,
     history_path="files/formatted.csv",
@@ -164,12 +166,14 @@ def apply_tfidf_classifier(
     name_col="Name",
     history_df=None,
 ):
+    # TF-IDF classification based on historical transaction names and categories
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.metrics.pairwise import cosine_similarity
     except Exception:
         return df
 
+    # 
     if history_df is None:
         history_file = Path(history_path)
         if not history_file.exists():
@@ -180,35 +184,44 @@ def apply_tfidf_classifier(
             return df
     if history_df.empty or name_col not in history_df.columns or category_col not in history_df.columns:
         return df
-
+    
+    # history_df must have valid categories to train on
     history_categories = history_df[category_col].fillna("").astype(str).str.strip()
     history_valid = ~history_categories.str.lower().eq("uncategorized") & history_categories.ne("")
     if not history_valid.any():
         return df
 
+    # Prepare training data (past transactions with known categories)
+    # loc: select data by label (select only valid rows)
     train_names = history_df.loc[history_valid, name_col].astype(str).map(_normalize_merchant)
     train_names_raw = history_df.loc[history_valid, name_col].astype(str).tolist()
     train_labels = history_df.loc[history_valid, category_col].astype(str).str.strip().tolist()
 
+    # For the target df, determine which rows need categorization
     out_df = df.copy()
-    categories = out_df[category_col].fillna("").astype(str).str.strip()
-    needs_category = categories.eq("") | categories.str.lower().eq("uncategorized")
+    categories = out_df[category_col].fillna("").astype(str).str.strip()            # existing categories
+    needs_category = categories.eq("") | categories.str.lower().eq("uncategorized") # rows needing categorization
     if not needs_category.any():
         return out_df
 
+    # for rows that need categorization, normalize the merchant names for vectorization
     target_names = out_df.loc[needs_category, name_col].astype(str).map(_normalize_merchant)
     if train_names.empty or target_names.empty:
         return out_df
 
-    # Character n-grams are more typo-tolerant for short merchant strings.
+    # Character n-grams are more typo-tolerant for short merchant strings
+    # Configure TF-IDF vectorizer to use character n-grams (3 to 5 characters) and ignore very rare terms (min_df=1)
     vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
-    train_vecs = vectorizer.fit_transform(train_names)
+    train_vecs = vectorizer.fit_transform(train_names)      # 
     target_vecs = vectorizer.transform(target_names)
 
+    # Compute cosine similarities and assign best matching categories
+    # Cosine similarity: compute similarity between target & training vectors based on direction
     sims = cosine_similarity(target_vecs, train_vecs)
     best_idx = sims.argmax(axis=1)
     best_scores = sims.max(axis=1)
 
+    # Only assign category if similarity exceeds threshold, otherwise leave as is (uncategorized)
     debug = os.getenv("TFIDF_DEBUG")
     for row_idx, label_idx, score in zip(target_names.index, best_idx, best_scores):
         if score >= min_similarity:
