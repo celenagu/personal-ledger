@@ -4,7 +4,6 @@
 from pathlib import Path
 import os
 import json
-import pandas as pd
 from formatter import (
     add_overall_total,
     attach_overall_total,
@@ -23,8 +22,7 @@ from categorizer import (
 )
 from llm_categorizer import apply_llm_classifier
 from sheets_uploader import SheetsUploader
-from errors import LedgerError
-from googleapiclient.errors import HttpError
+from errors import run
 
 # All paths (files/, secrets/) are relative to the project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -33,35 +31,20 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Helper Functions
 # ==============================
 
-# Helper function for configuration and environment variable handling
+# Read secrets/gsheets_config.json ({} if missing or invalid)
 def _read_gsheets_config(path="secrets/gsheets_config.json"):
-    config_path = Path(path)
-    if not config_path.exists():
-        return {}
     try:
-        with config_path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
         return {}
 
-# Interpret truth values
-def _truthy(value):
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value == 1
+# Gemini runs when LLM_CATEGORIZE=1 or "llm_enabled": true in the config
+def llm_enabled(config):
+    value = config.get("llm_enabled")
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return False
-
-# check if config key is enabled
-def _config_enabled(config, key):
-    return _truthy(config.get(key))
-
-# check if environment variable is enabled
-def _env_enabled(name):
-    return os.getenv(name) == "1"
+        value = value.strip().lower() in {"1", "true", "yes", "on"}
+    return os.getenv("LLM_CATEGORIZE") == "1" or value is True or value == 1
 
 # ==============================
 # Main Functionality
@@ -71,7 +54,6 @@ def _env_enabled(name):
 def main():
     # Run from the project root so relative paths work no matter where the script is launched from
     os.chdir(PROJECT_ROOT)
-    out_file = "files/formatted.csv"
 
     # Merge input files
     new_df = merge_input_files()        # df = pd.DataFrame
@@ -79,36 +61,30 @@ def main():
     # Note: what is a data frame?
     # 2D, size-mutable, potentially heterogeneous tabular data structure with labeled axes (rows and columns).
 
-    # Read current google sheets config
+    # Read what's already in the Google Sheet and learn from it
     config = _read_gsheets_config()
-    sync_enabled = _env_enabled("SHEETS_SYNC") or _config_enabled(config, "sync_enabled")
-    history_enabled = _env_enabled("SHEETS_HISTORY") or _config_enabled(config, "history_enabled") or sync_enabled
-    sheets_history = None
+    sheets_history = normalize_history_df(SheetsUploader().read_sheet())
+    if sheets_history.empty:
+        sheets_history = None
+    update_merchant_map_from_history(history_df=sheets_history)
 
-    # Read history from Google Sheets if enabled
-    if history_enabled:
-        sheets_history = SheetsUploader().read_sheet()
-        sheets_history = normalize_history_df(sheets_history)   
-        if sheets_history is not None and sheets_history.empty:
-            sheets_history = None
-
-    # Update merchant map and apply categorization from sheet history if exists
-    if sheets_history is None:
-        update_merchant_map_from_history()
-    else:
-        update_merchant_map_from_history(history_df=sheets_history)
+    # Only categorize rows that aren't already in the sheet (saves Gemini quota)
+    _, new_df = dedupe_new_rows(new_df, sheets_history)
+    print(f"{len(new_df)} new transaction(s) to categorize")
 
     # apply merchant map, then LLM (if enabled), then TF-IDF for anything still uncategorized
     # Each step's results are logged with their source: TF-IDF guesses are never learned as rules,
     # and any category later changed in the sheet is recognized as a correction
     def categorize(step, source, df):
+        if df.empty:
+            return df
         before = is_uncategorized(df["Category"])
         df = step(df)
         record_assignments(df.loc[before & ~is_uncategorized(df["Category"])], source)
         return df
 
     new_df = categorize(apply_merchant_map, "map", new_df)
-    if _env_enabled("LLM_CATEGORIZE") or _config_enabled(config, "llm_enabled"):
+    if llm_enabled(config):
         new_df = categorize(lambda df: apply_llm_classifier(df, history_df=sheets_history), "llm", new_df)
     min_sim = float(os.getenv("TFIDF_MIN_SIM", "0.35"))
     new_df = categorize(
@@ -117,19 +93,8 @@ def main():
         new_df,
     )
 
-    # Deduplicate with existing data
-    master_df = None
-    if sheets_history is not None:
-        master_df = sheets_history.copy()   # Pull existing data from sheets history
-    # error handling for reading existing formatted file
-    elif Path(out_file).exists():
-        try:
-            master_df = pd.read_csv(out_file)
-        except pd.errors.EmptyDataError:
-            master_df = None
-
-    # Deduplicate new rows against master data
-    combined, new_only = dedupe_new_rows(new_df, master_df)
+    # Combine the categorized new rows with the existing data
+    combined, new_only = dedupe_new_rows(new_df, sheets_history)
 
     # Sort, add totals, and prepare output dataframes
     combined_sorted = sort_transactions(combined)
@@ -145,41 +110,18 @@ def main():
     if "Date" in new_only_out.columns:
         new_only_out["Date"] = normalize_date_series(new_only_out["Date"])
 
-    # Upload to Google Sheets if sync is enabled, else save locally
-    if sync_enabled:
-        uploader = SheetsUploader()
-        upload_mode = uploader.get_mode()
-        if upload_mode == "append":
-            if not new_only_out.empty:
-                uploader.upload_df(new_only_out)
-                print("Uploaded to Google Sheets")
-            else:
-                print("No new rows to append")
-        else:
-            uploader.upload_df(combined_out)
+    # Upload to Google Sheets: only new rows in append mode, everything in overwrite mode
+    uploader = SheetsUploader()
+    if uploader.get_mode() == "append":
+        if not new_only_out.empty:
+            uploader.upload_df(new_only_out)
             print("Uploaded to Google Sheets")
+        else:
+            print("No new rows to append")
     else:
-        print("Merged and saved to:", out_file)
+        uploader.upload_df(combined_out)
+        print("Uploaded to Google Sheets")
 
 # Execute main function with error handling
 if __name__ == "__main__":
-    import traceback, sys
-    try:
-        main()
-    except LedgerError as e:
-        # Expected problem: message already explains the fix
-        print(f"\nError: {e}")
-        input("Press Enter to exit...")
-        sys.exit(1)
-    except HttpError as e:
-        # Google Sheets API rejected the request (bad spreadsheet_id, no access, sheet tab missing, ...)
-        print(f"\nGoogle Sheets error {e.status_code}: {e.reason}")
-        print("Check spreadsheet_id and sheet_name in secrets/gsheets_config.json, "
-              "and that the signed-in Google account can edit the sheet.")
-        input("Press Enter to exit...")
-        sys.exit(1)
-    except Exception:
-        # Unexpected bug: show the full traceback
-        traceback.print_exc()
-        input("Error occurred. Press Enter to exit...")
-        sys.exit(1)
+    run(main, pause=True)

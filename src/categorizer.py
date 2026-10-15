@@ -53,6 +53,9 @@ def _normalize_merchant(value):
     if not text:
         return ""
     tokens = [tok for tok in text.split(" ") if tok and tok not in _GENERIC_TOKENS]
+    # Drop a trailing one-letter code (older exports end names with "_M", "_V", "_F"...)
+    if len(tokens) > 1 and len(tokens[-1]) == 1 and tokens[-1].isalpha():
+        tokens = tokens[:-1]
     return " ".join(tokens).strip()
 
 # Load merchant mapping rules from CSV
@@ -90,9 +93,8 @@ def apply_merchant_map(
         return df          # no rules to apply, return original DataFrame
 
     out_df = df.copy()
-    categories = out_df[category_col].fillna("").astype(str).str.strip()            # existing categories
-    needs_category = categories.eq("") | categories.str.lower().eq("uncategorized") # rows needing categorization (current blank or "Uncategorized")
-    normalized_names = out_df[name_col].astype(str).map(_normalize_merchant)        # normalized merchant names
+    needs_category = is_uncategorized(out_df[category_col])                     # rows needing categorization
+    normalized_names = out_df[name_col].astype(str).map(_normalize_merchant)    # normalized merchant names
 
     # Apply rules to rows needing categorization
     for idx in out_df.index[needs_category]:
@@ -171,22 +173,12 @@ def confirmed_history(history_df, name_col="Name", category_col="Category", assi
 
 # Update merchant mapping rules from history DataFrame
 def update_merchant_map_from_history(
-    history_path="files/formatted.csv",
     map_path="files/rules/merchant_map.csv",
     name_col="Name",
     category_col="Category",
     history_df=None,
     categories_path=CATEGORIES_PATH,
 ):
-    if history_df is None:
-        history_file = Path(history_path)
-        if not history_file.exists():
-            return
-        try:
-            history_df = pd.read_csv(history_file)
-        except pd.errors.EmptyDataError:
-            return
-
     # Only learn from trusted categories (map, Gemini, or set by hand), never from TF-IDF guesses
     temp = confirmed_history(history_df, name_col, category_col)
     if temp is None or temp.empty:
@@ -257,7 +249,6 @@ def update_merchant_map_from_history(
 # Apply TF-IDF classifier to categorize transactions
 def apply_tfidf_classifier(
     df,
-    history_path="files/formatted.csv",
     min_similarity=0.35,
     category_col="Category",
     name_col="Name",
@@ -270,15 +261,6 @@ def apply_tfidf_classifier(
     except Exception:
         return df
 
-    # 
-    if history_df is None:
-        history_file = Path(history_path)
-        if not history_file.exists():
-            return df
-        try:
-            history_df = pd.read_csv(history_file)
-        except pd.errors.EmptyDataError:
-            return df
     # Train only on trusted categories, so TF-IDF doesn't learn from its own past guesses
     confirmed = confirmed_history(history_df, name_col, category_col)
     if confirmed is None or confirmed.empty:
@@ -291,8 +273,7 @@ def apply_tfidf_classifier(
 
     # For the target df, determine which rows need categorization
     out_df = df.copy()
-    categories = out_df[category_col].fillna("").astype(str).str.strip()            # existing categories
-    needs_category = categories.eq("") | categories.str.lower().eq("uncategorized") # rows needing categorization
+    needs_category = is_uncategorized(out_df[category_col])     # rows needing categorization
     if not needs_category.any():
         return out_df
 

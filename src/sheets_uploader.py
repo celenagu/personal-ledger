@@ -22,6 +22,11 @@ def _sheet_range(sheet_name, cell_range=None):
     return f"{prefix}!{cell_range}"
 
 
+# DataFrame rows as lists, with blanks instead of NaN
+def _rows(df):
+    return [["" if pd.isna(cell) else cell for cell in row] for row in df.itertuples(index=False)]
+
+
 # 0-based column index to A1 letters (0 -> A, 26 -> AA)
 def _column_letter(index):
     letters = ""
@@ -132,17 +137,18 @@ class SheetsUploader:
         self.credentials_path = credentials_path
         self.token_path = token_path
 
-    def read_sheet(self):
+    # Load config, sign in, and return (service, spreadsheet_id, sheet_name, config)
+    def _connect(self):
         config = _load_config(self.config_path)
         spreadsheet_id = config.get("spreadsheet_id")
         sheet_name = config.get("sheet_name")
-
         if not spreadsheet_id or not sheet_name:
             raise LedgerError("secrets/gsheets_config.json must include spreadsheet_id and sheet_name")
-
         creds = _load_credentials(self.credentials_path, self.token_path)
-        service = build("sheets", "v4", credentials=creds)
+        return build("sheets", "v4", credentials=creds), spreadsheet_id, sheet_name, config
 
+    def read_sheet(self):
+        service, spreadsheet_id, sheet_name, _ = self._connect()
         response = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=_sheet_range(sheet_name),
@@ -161,14 +167,7 @@ class SheetsUploader:
 
     # Overwrite one column's data cells (row 2 down) with the given values, leaving other columns untouched
     def write_column(self, column_index, values):
-        config = _load_config(self.config_path)
-        spreadsheet_id = config.get("spreadsheet_id")
-        sheet_name = config.get("sheet_name")
-        if not spreadsheet_id or not sheet_name:
-            raise LedgerError("secrets/gsheets_config.json must include spreadsheet_id and sheet_name")
-
-        creds = _load_credentials(self.credentials_path, self.token_path)
-        service = build("sheets", "v4", credentials=creds)
+        service, spreadsheet_id, sheet_name, _ = self._connect()
         letter = _column_letter(column_index)
         service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
@@ -177,18 +176,10 @@ class SheetsUploader:
             body={"values": [[v] for v in values]},
         ).execute()
 
-# upload DataFrame to Google Sheets with append or overwrite mode
+    # Upload DataFrame to Google Sheets with append or overwrite mode
     def upload_df(self, df):
-        config = _load_config(self.config_path)
-        spreadsheet_id = config.get("spreadsheet_id")
-        sheet_name = config.get("sheet_name")
+        service, spreadsheet_id, sheet_name, config = self._connect()
         mode = config.get("mode", "append").lower()
-
-        if not spreadsheet_id or not sheet_name:
-            raise LedgerError("secrets/gsheets_config.json must include spreadsheet_id and sheet_name")
-
-        creds = _load_credentials(self.credentials_path, self.token_path)
-        service = build("sheets", "v4", credentials=creds)
 
         preferred = ["Date", "Category", "Name", "Type", "Out", "In", "Total"]
         if all(col in df.columns for col in preferred):
@@ -199,9 +190,7 @@ class SheetsUploader:
             df = df.copy()
             df["Date"] = df["Date"].astype(str)
 
-        values = [df.columns.tolist()]
-        for row in df.itertuples(index=False):
-            values.append(["" if pd.isna(cell) else cell for cell in row])
+        values = [df.columns.tolist()] + _rows(df)
 
         if mode == "overwrite":
             service.spreadsheets().values().clear(
@@ -243,7 +232,7 @@ class SheetsUploader:
                 ).execute()
                 canonical = canonical + extra
             df = df.reindex(columns=canonical)
-            payload = [["" if pd.isna(cell) else cell for cell in row] for row in df.itertuples(index=False)]
+            payload = _rows(df)
         if not payload:
             return
         service.spreadsheets().values().append(
@@ -256,7 +245,3 @@ class SheetsUploader:
         sheet_id = _get_sheet_id(service, spreadsheet_id, sheet_name)
         if "Date" in df.columns:
             _set_date_format(service, spreadsheet_id, sheet_id, df.columns.get_loc("Date"))
-
-    def upload_csv(self, csv_path):
-        df = pd.read_csv(csv_path)
-        self.upload_df(df)

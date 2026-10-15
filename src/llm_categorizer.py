@@ -7,7 +7,7 @@ from typing import List
 import pandas as pd
 from pydantic import BaseModel
 
-from categorizer import CATEGORIES_PATH, UNCATEGORIZED, _load_merchant_map, confirmed_history, load_categories
+from categorizer import CATEGORIES_PATH, UNCATEGORIZED, _load_merchant_map, confirmed_history, is_uncategorized, load_categories
 
 DEFAULT_MODEL = "gemini-3.8-flash"     # Gemini API free tier
 API_KEY_PATH = "secrets/gemini_api_key.txt"
@@ -93,8 +93,7 @@ def apply_llm_classifier(
     history_df=None,
 ):
     out_df = df.copy()
-    categories = out_df[category_col].fillna("").astype(str).str.strip()
-    needs_category = categories.eq("") | categories.str.lower().eq(UNCATEGORIZED.lower())
+    needs_category = is_uncategorized(out_df[category_col])
     if not needs_category.any():
         return out_df
 

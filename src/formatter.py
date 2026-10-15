@@ -194,12 +194,6 @@ def attach_overall_total(new_only_df, combined_sorted):
         how="left",
     )
 
-# Format input CSV and save to output CSV
-def format_csv(in_file, out_file):
-    df = format_to_df(in_file)
-    df.to_csv(out_file, index=False)
-    print("Formatted and saved to:", out_file)
-
 # Sort transactions by Date, then by Source and Name
 def sort_transactions(df):
     # - Primary: Date ascending

@@ -213,3 +213,5 @@ files/input/savings.csv
 secrets/gemini_api_key.txt
 files/rules/assigned_categories.csv
 files/backups/
+/y
+/y.pub

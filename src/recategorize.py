@@ -3,13 +3,10 @@
 # Shows every change and asks before writing; only the Category column is changed.
 
 import os
-import sys
-import traceback
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from googleapiclient.errors import HttpError
 
 from categorizer import (
     apply_merchant_map,
@@ -17,10 +14,10 @@ from categorizer import (
     load_categories,
     record_assignments,
 )
-from errors import LedgerError
+from errors import LedgerError, run
 from formatter import canonical_column, normalize_history_df
 from llm_categorizer import apply_llm_classifier
-from main import PROJECT_ROOT, _config_enabled, _env_enabled, _read_gsheets_config
+from main import PROJECT_ROOT, _read_gsheets_config, llm_enabled
 from sheets_uploader import SheetsUploader
 
 BACKUP_DIR = "files/backups"    # gitignored
@@ -55,7 +52,7 @@ def recategorize():
     off_list = ~current.isin(allowed) if allowed else pd.Series(False, index=sheet.index)
     need_llm = ~by_map & (is_uncategorized(current) | off_list)
     config = _read_gsheets_config()
-    if need_llm.any() and (_env_enabled("LLM_CATEGORIZE") or _config_enabled(config, "llm_enabled")):
+    if need_llm.any() and llm_enabled(config):
         llm = apply_llm_classifier(proposed.loc[need_llm], history_df=sheet)
         by_llm = ~is_uncategorized(llm["Category"])
         proposed.loc[llm.index[by_llm], "Category"] = llm.loc[by_llm, "Category"]
@@ -119,14 +116,4 @@ def recategorize():
 
 
 if __name__ == "__main__":
-    try:
-        recategorize()
-    except LedgerError as e:
-        print(f"\nError: {e}")
-        sys.exit(1)
-    except HttpError as e:
-        print(f"\nGoogle Sheets error {e.status_code}: {e.reason}")
-        sys.exit(1)
-    except Exception:
-        traceback.print_exc()
-        sys.exit(1)
+    run(recategorize)
