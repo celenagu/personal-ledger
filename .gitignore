@@ -208,4 +208,5 @@ __marimo__/
 
 
 
-secrets/gsheets_token.json   
+secrets/gsheets_token.json
+files/input/savings.csv
