@@ -17,9 +17,17 @@ from formatter import (
 from categorizer import (
     apply_merchant_map,
     apply_tfidf_classifier,
+    is_uncategorized,
+    record_assignments,
     update_merchant_map_from_history,
 )
+from llm_categorizer import apply_llm_classifier
 from sheets_uploader import SheetsUploader
+from errors import LedgerError
+from googleapiclient.errors import HttpError
+
+# All paths (files/, secrets/) are relative to the project root
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # ==============================
 # Helper Functions
@@ -61,6 +69,8 @@ def _env_enabled(name):
 
 # main function to process and upload data
 def main():
+    # Run from the project root so relative paths work no matter where the script is launched from
+    os.chdir(PROJECT_ROOT)
     out_file = "files/formatted.csv"
 
     # Merge input files
@@ -88,13 +98,23 @@ def main():
     else:
         update_merchant_map_from_history(history_df=sheets_history)
 
-    # apply merchant map and TF-IDF classification on incoming data
-    new_df = apply_merchant_map(new_df)
+    # apply merchant map, then LLM (if enabled), then TF-IDF for anything still uncategorized
+    # Each step's results are logged with their source: TF-IDF guesses are never learned as rules,
+    # and any category later changed in the sheet is recognized as a correction
+    def categorize(step, source, df):
+        before = is_uncategorized(df["Category"])
+        df = step(df)
+        record_assignments(df.loc[before & ~is_uncategorized(df["Category"])], source)
+        return df
+
+    new_df = categorize(apply_merchant_map, "map", new_df)
+    if _env_enabled("LLM_CATEGORIZE") or _config_enabled(config, "llm_enabled"):
+        new_df = categorize(lambda df: apply_llm_classifier(df, history_df=sheets_history), "llm", new_df)
     min_sim = float(os.getenv("TFIDF_MIN_SIM", "0.35"))
-    new_df = apply_tfidf_classifier(
+    new_df = categorize(
+        lambda df: apply_tfidf_classifier(df, min_similarity=min_sim, history_df=sheets_history),
+        "tfidf",
         new_df,
-        min_similarity=min_sim,
-        history_df=sheets_history,
     )
 
     # Deduplicate with existing data
@@ -146,7 +166,20 @@ if __name__ == "__main__":
     import traceback, sys
     try:
         main()
+    except LedgerError as e:
+        # Expected problem: message already explains the fix
+        print(f"\nError: {e}")
+        input("Press Enter to exit...")
+        sys.exit(1)
+    except HttpError as e:
+        # Google Sheets API rejected the request (bad spreadsheet_id, no access, sheet tab missing, ...)
+        print(f"\nGoogle Sheets error {e.status_code}: {e.reason}")
+        print("Check spreadsheet_id and sheet_name in secrets/gsheets_config.json, "
+              "and that the signed-in Google account can edit the sheet.")
+        input("Press Enter to exit...")
+        sys.exit(1)
     except Exception:
+        # Unexpected bug: show the full traceback
         traceback.print_exc()
         input("Error occurred. Press Enter to exit...")
         sys.exit(1)

@@ -3,6 +3,7 @@
 from pathlib import Path
 import pandas as pd
 from functools import cmp_to_key
+from errors import LedgerError
 
 # Infer account type from filename
 def infer_type_from_name(in_file):
@@ -18,11 +19,23 @@ def infer_type_from_name(in_file):
 # Format CSV to standardized DataFrame
 def format_to_df(in_file):
     # Read CSV without header
-    df = pd.read_csv(in_file, header=None)
+    try:
+        df = pd.read_csv(in_file, header=None)
+    except pd.errors.EmptyDataError:
+        raise LedgerError(f"{in_file} is empty. Re-export it from the bank or delete it.")
+    except pd.errors.ParserError as e:
+        raise LedgerError(f"Could not parse {in_file} as CSV: {e}")
     account_type = infer_type_from_name(in_file)
 
     # Drop completely empty rows
     df = df.dropna(how="all")
+
+    # TD exports have exactly 5 columns with no header row
+    if df.shape[1] != 5:
+        raise LedgerError(
+            f"{in_file} has {df.shape[1]} columns, expected 5 (Date, Name, Out, In, Total). "
+            "Is it a TD CSV export?"
+        )
 
     # Standardize to 5 columns: Date, Name, Out, In, Total
     df.columns = ["Date", "Name", "Out", "In", "Total"]
@@ -61,6 +74,11 @@ def merge_input_files(
             frames.append(df)
         return pd.concat(frames, ignore_index=True)
 
+    if not Path(default_file).exists():
+        raise LedgerError(
+            "No input files found. Put at least one of these in place: "
+            + ", ".join(candidates + [default_file])
+        )
     df = format_to_df(default_file)
     df["Source"] = Path(default_file).name
     df["OrigOrder"] = range(len(df))
@@ -96,30 +114,32 @@ def normalize_date_series(series):
     formatted = formatted.where(parsed.notna(), raw)
     return formatted
 
+# Map a sheet header name to the standard column name (unknown names are kept as-is)
+def canonical_column(col):
+    key = str(col).strip().lower()
+    if key in {"date", "transaction date"}:
+        return "Date"
+    if key in {"name", "description", "merchant"}:
+        return "Name"
+    if key in {"type", "account", "account type"}:
+        return "Type"
+    if key in {"out", "debit", "withdrawal"}:
+        return "Out"
+    if key in {"in", "credit", "deposit"}:
+        return "In"
+    if key in {"amount", "signedamount", "signed amount"}:
+        return "SignedAmount"
+    if key in {"category"}:
+        return "Category"
+    if key in {"total", "balance"}:
+        return "Total"
+    return col
+
 # Normalize history DataFrame columns
 def normalize_history_df(df):
     if df is None or df.empty:
         return df
-    col_map = {}
-    for col in df.columns:
-        key = str(col).strip().lower()
-        if key in {"date", "transaction date"}:
-            col_map[col] = "Date"
-        elif key in {"name", "description", "merchant"}:
-            col_map[col] = "Name"
-        elif key in {"type", "account", "account type"}:
-            col_map[col] = "Type"
-        elif key in {"out", "debit", "withdrawal"}:
-            col_map[col] = "Out"
-        elif key in {"in", "credit", "deposit"}:
-            col_map[col] = "In"
-        elif key in {"amount", "signedamount", "signed amount"}:
-            col_map[col] = "SignedAmount"
-        elif key in {"category"}:
-            col_map[col] = "Category"
-        elif key in {"total", "balance"}:
-            col_map[col] = "Total"
-    df = df.rename(columns=col_map)
+    df = df.rename(columns={col: canonical_column(col) for col in df.columns})
 
     if "Name" in df.columns:
         df["Name"] = (

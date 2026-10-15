@@ -1,0 +1,14 @@
+# Categories the LLM is allowed to assign, one per line.
+# Lines starting with # are ignored. Anything that doesn't fit stays "Uncategorized".
+Clothing
+Credit Card Payment
+Eating Out
+Entertainment
+General Merchandise
+Groceries
+Health
+Housing
+Income
+Subscription
+Transfers
+Transportation

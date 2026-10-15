@@ -2,10 +2,14 @@ import json
 from pathlib import Path
 
 import pandas as pd
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
+from errors import LedgerError
+from formatter import canonical_column
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -18,25 +22,60 @@ def _sheet_range(sheet_name, cell_range=None):
     return f"{prefix}!{cell_range}"
 
 
+# 0-based column index to A1 letters (0 -> A, 26 -> AA)
+def _column_letter(index):
+    letters = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
 def _load_config(config_path):
     path = Path(config_path)
     if not path.exists():
-        raise FileNotFoundError(f"Missing config file: {config_path}")
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        raise LedgerError(f"Missing config file: {config_path}")
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except json.JSONDecodeError as e:
+        raise LedgerError(f"{config_path} is not valid JSON: {e}")
+
+
+def _sign_in(credentials_path):
+    if not Path(credentials_path).exists():
+        raise LedgerError(
+            f"Missing {credentials_path}. Download an OAuth client JSON from Google Cloud Console "
+            "(APIs & Services > Credentials) and save it there."
+        )
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
+    except ValueError as e:
+        raise LedgerError(f"{credentials_path} is not a valid OAuth client file: {e}")
+    print("Opening browser to sign in to Google...")
+    return flow.run_local_server(port=0)
 
 
 def _load_credentials(credentials_path, token_path):
     creds = None
     token_file = Path(token_path)
     if token_file.exists():
-        creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
+        except ValueError:
+            # Corrupt or incomplete token file: ignore it and sign in again
+            creds = None
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                # Token was revoked or expired (e.g. app in "Testing" mode, or unused for months)
+                print("Saved Google sign-in has expired.")
+                creds = _sign_in(credentials_path)
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = _sign_in(credentials_path)
         token_file.parent.mkdir(parents=True, exist_ok=True)
         token_file.write_text(creds.to_json(), encoding="utf-8")
     return creds
@@ -99,7 +138,7 @@ class SheetsUploader:
         sheet_name = config.get("sheet_name")
 
         if not spreadsheet_id or not sheet_name:
-            raise ValueError("Config must include spreadsheet_id and sheet_name")
+            raise LedgerError("secrets/gsheets_config.json must include spreadsheet_id and sheet_name")
 
         creds = _load_credentials(self.credentials_path, self.token_path)
         service = build("sheets", "v4", credentials=creds)
@@ -120,6 +159,24 @@ class SheetsUploader:
         config = _load_config(self.config_path)
         return config.get("mode", "append").lower()
 
+    # Overwrite one column's data cells (row 2 down) with the given values, leaving other columns untouched
+    def write_column(self, column_index, values):
+        config = _load_config(self.config_path)
+        spreadsheet_id = config.get("spreadsheet_id")
+        sheet_name = config.get("sheet_name")
+        if not spreadsheet_id or not sheet_name:
+            raise LedgerError("secrets/gsheets_config.json must include spreadsheet_id and sheet_name")
+
+        creds = _load_credentials(self.credentials_path, self.token_path)
+        service = build("sheets", "v4", credentials=creds)
+        letter = _column_letter(column_index)
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=_sheet_range(sheet_name, f"{letter}2:{letter}{len(values) + 1}"),
+            valueInputOption="RAW",
+            body={"values": [[v] for v in values]},
+        ).execute()
+
 # upload DataFrame to Google Sheets with append or overwrite mode
     def upload_df(self, df):
         config = _load_config(self.config_path)
@@ -128,7 +185,7 @@ class SheetsUploader:
         mode = config.get("mode", "append").lower()
 
         if not spreadsheet_id or not sheet_name:
-            raise ValueError("Config must include spreadsheet_id and sheet_name")
+            raise LedgerError("secrets/gsheets_config.json must include spreadsheet_id and sheet_name")
 
         creds = _load_credentials(self.credentials_path, self.token_path)
         service = build("sheets", "v4", credentials=creds)
@@ -163,14 +220,30 @@ class SheetsUploader:
             return
 
         if mode != "append":
-            raise ValueError("mode must be 'append' or 'overwrite'")
+            raise LedgerError("mode in secrets/gsheets_config.json must be 'append' or 'overwrite'")
 
         existing = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=_sheet_range(sheet_name, "A1:A1"),
+            range=_sheet_range(sheet_name, "1:1"),
         ).execute()
-        has_header = bool(existing.get("values"))
-        payload = values if not has_header else values[1:]
+        header = (existing.get("values") or [[]])[0]
+        if not header:
+            payload = values
+        else:
+            # Line the new rows up with the sheet's existing columns,
+            # adding any new columns to the end of the header row
+            canonical = [canonical_column(h) for h in header]
+            extra = [c for c in df.columns if c not in canonical]
+            if extra:
+                service.spreadsheets().values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range=_sheet_range(sheet_name, "A1"),
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [header + extra]},
+                ).execute()
+                canonical = canonical + extra
+            df = df.reindex(columns=canonical)
+            payload = [["" if pd.isna(cell) else cell for cell in row] for row in df.itertuples(index=False)]
         if not payload:
             return
         service.spreadsheets().values().append(

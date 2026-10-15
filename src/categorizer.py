@@ -3,6 +3,27 @@ import re
 from pathlib import Path
 import pandas as pd
 
+CATEGORIES_PATH = "files/rules/categories.txt"
+ASSIGNMENTS_PATH = "files/rules/assigned_categories.csv"    # gitignored log of categories the script assigned
+UNCATEGORIZED = "Uncategorized"
+
+# True where a category is blank or "Uncategorized"
+def is_uncategorized(series):
+    categories = series.fillna("").astype(str).str.strip()
+    return categories.eq("") | categories.str.lower().eq(UNCATEGORIZED.lower())
+
+# Load the fixed list of allowed categories (one per line, # for comments); empty if no list
+def load_categories(path=CATEGORIES_PATH):
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    categories = []
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#") and line.lower() != UNCATEGORIZED.lower() and line not in categories:
+            categories.append(line)
+    return categories
 
 _GENERIC_TOKENS = {
     "store",
@@ -74,14 +95,79 @@ def apply_merchant_map(
     normalized_names = out_df[name_col].astype(str).map(_normalize_merchant)        # normalized merchant names
 
     # Apply rules to rows needing categorization
-    # basic substring match on normalized names
     for idx in out_df.index[needs_category]:
-        name = normalized_names.at[idx]
-        for rule in merchant_rules:
-            if rule["merchant"] in name:
-                out_df.at[idx, category_col] = rule["category"]
-                break
+        category = _match_rule(merchant_rules, normalized_names.at[idx])
+        if category:
+            out_df.at[idx, category_col] = category
     return out_df
+
+# Find the category of the most specific (longest) rule whose merchant is a substring of the name
+def _match_rule(merchant_rules, normalized_name):
+    best = None
+    for rule in merchant_rules:
+        if rule["merchant"] in normalized_name and (best is None or len(rule["merchant"]) > len(best["merchant"])):
+            best = rule
+    return best["category"] if best else None
+
+# Identify a transaction by date, merchant and amounts, so logged categories can be matched to sheet rows
+def _transaction_keys(df, name_col="Name"):
+    def col(name):
+        return df[name] if name in df.columns else pd.Series("", index=df.index)
+    def amount(name):
+        values = pd.to_numeric(col(name).astype(str).str.replace(",", "").str.replace("$", ""), errors="coerce")
+        return values.map(lambda v: "" if pd.isna(v) or v == 0 else f"{v:.2f}")
+    date = col("Date").fillna("").astype(str).str.strip()
+    name = df[name_col].astype(str).map(_normalize_merchant)
+    return date + "|" + name + "|" + amount("Out") + "|" + amount("In")
+
+# Load the log of categories the script assigned: {transaction key: (category, source)}
+def _load_assignments(path=ASSIGNMENTS_PATH):
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        df = pd.read_csv(p, dtype=str).fillna("")
+    except pd.errors.EmptyDataError:
+        return {}
+    return {k: (c, s) for k, c, s in zip(df["key"], df["category"], df["source"])}
+
+# Log the categories this run assigned and where they came from ("map", "llm" or "tfidf"),
+# so later changes in the sheet can be recognized as corrections
+def record_assignments(df, source, name_col="Name", category_col="Category", path=ASSIGNMENTS_PATH):
+    if df.empty:
+        return
+    known = _load_assignments(path)
+    keys = _transaction_keys(df, name_col)
+    new = {k: str(c).strip() for k, c in zip(keys, df[category_col]) if k not in known}
+    if not new:
+        return
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([(k, c, source) for k, c in new.items()], columns=["key", "category", "source"]).to_csv(
+        p, mode="a", header=not p.exists(), index=False
+    )
+
+# Keep only history rows that are safe to learn from.
+# Rows still holding a TF-IDF guess are skipped (it matches letters, not meaning);
+# rows whose category was changed in the sheet since the script assigned it are marked
+# "Corrected" and win over other rows for the same merchant.
+def confirmed_history(history_df, name_col="Name", category_col="Category", assignments_path=ASSIGNMENTS_PATH):
+    if history_df is None or history_df.empty or name_col not in history_df.columns or category_col not in history_df.columns:
+        return None
+    categories = history_df[category_col].fillna("").astype(str).str.strip()
+    log = _load_assignments(assignments_path)
+    logged = _transaction_keys(history_df, name_col).map(log)
+    logged_category = logged.map(lambda v: v[0] if isinstance(v, tuple) else None)
+    logged_source = logged.map(lambda v: v[1] if isinstance(v, tuple) else None)
+    unchanged = logged_category.eq(categories)
+    corrected = logged_category.notna() & ~unchanged
+    tfidf_guess = unchanged & logged_source.eq("tfidf")
+
+    confirmed = ~is_uncategorized(categories) & ~tfidf_guess
+    out = history_df.loc[confirmed].copy()
+    out[category_col] = categories[confirmed]
+    out["Corrected"] = corrected[confirmed]
+    return out
 
 # Update merchant mapping rules from history DataFrame
 def update_merchant_map_from_history(
@@ -90,6 +176,7 @@ def update_merchant_map_from_history(
     name_col="Name",
     category_col="Category",
     history_df=None,
+    categories_path=CATEGORIES_PATH,
 ):
     if history_df is None:
         history_file = Path(history_path)
@@ -99,63 +186,73 @@ def update_merchant_map_from_history(
             history_df = pd.read_csv(history_file)
         except pd.errors.EmptyDataError:
             return
-    if history_df.empty or name_col not in history_df.columns or category_col not in history_df.columns:
+
+    # Only learn from trusted categories (map, Gemini, or set by hand), never from TF-IDF guesses
+    temp = confirmed_history(history_df, name_col, category_col)
+    if temp is None or temp.empty:
         return
 
-    categories = history_df[category_col].fillna("").astype(str).str.strip()
-    valid = ~categories.str.lower().eq("uncategorized") & categories.ne("")
-    if not valid.any():
-        return
-
-    base_map = _load_merchant_map(map_path)
-    base_merchants = {entry["merchant"] for entry in base_map}
-
-    temp = history_df.loc[valid, [name_col, category_col]].copy()
+    # With a category list, ignore rows whose category isn't on it (e.g. old "Shopping" rows)
+    allowed = load_categories(categories_path)
+    if allowed:
+        on_list = temp[category_col].isin(allowed)
+        if not on_list.all():
+            ignored = sorted(temp.loc[~on_list, category_col].unique())
+            print(f"Merchant map: ignored sheet rows with categories not in {categories_path}: {', '.join(ignored)}")
+        temp = temp[on_list]
     temp["merchant_norm"] = temp[name_col].map(_normalize_merchant)
-    temp["category_norm"] = temp[category_col].astype(str).str.strip()
     temp = temp[temp["merchant_norm"].ne("")]
-
     if temp.empty:
         return
 
+    # Pick one category per merchant: corrections win over other rows, then the most common category
     counts = (
-        temp.groupby(["merchant_norm", "category_norm"])
-        .size()
-        .rename("count")
+        temp.groupby(["merchant_norm", category_col])
+        .agg(corrected=("Corrected", "sum"), count=("Corrected", "size"))
         .reset_index()
     )
     counts = counts.sort_values(
-        ["merchant_norm", "count", "category_norm"],
-        ascending=[True, False, True],
+        ["merchant_norm", "corrected", "count", category_col],
+        ascending=[True, False, False, True],
         kind="mergesort",
     )
     best = counts.drop_duplicates(subset=["merchant_norm"], keep="first")
 
-    updates = []
-    def _overlaps_existing(existing, merchant):
-        for known in existing:
-            if known in merchant or merchant in known:
-                return True
-        return False
-    for _, row in best.iterrows():
-        merchant = row["merchant_norm"]
-        if merchant in base_merchants:
-            continue
-        if _overlaps_existing(base_merchants, merchant):
-            continue
-        updates.append({"merchant": merchant, "category": row["category_norm"]})
-        base_merchants.add(merchant)
+    path = Path(map_path)
+    if path.exists():
+        map_df = pd.read_csv(path)
+        map_df.columns = [str(c).strip().lower() for c in map_df.columns]
+    else:
+        map_df = pd.DataFrame(columns=["merchant", "category"])
+    map_keys = map_df["merchant"].map(_normalize_merchant) if not map_df.empty else pd.Series(dtype=str)
+    rules = _load_merchant_map(map_path)
 
-    if not updates:
+    changed, added = [], []
+    for _, row in best.iterrows():
+        merchant, category = row["merchant_norm"], row[category_col]
+        exact = map_keys.eq(merchant)
+        if exact.any():
+            # Existing entry for this exact merchant: update it if the user's category differs
+            current = map_df.loc[exact, "category"].astype(str).str.strip()
+            if not current.eq(category).all():
+                map_df.loc[exact, "category"] = category
+                changed.append(f"{merchant}: {current.iloc[0]} -> {category}")
+        elif _match_rule(rules, merchant) != category:
+            # No rule gives this category yet: add a specific entry (longest match wins)
+            added.append({"merchant": merchant, "category": category})
+            rules.append({"merchant": merchant, "category": category})
+
+    if not changed and not added:
         return
 
-    path = Path(map_path)
+    if added:
+        map_df = pd.concat([map_df, pd.DataFrame(added)], ignore_index=True)
     path.parent.mkdir(parents=True, exist_ok=True)
-    out_df = pd.DataFrame(updates)
-    if path.exists():
-        existing = pd.read_csv(path)
-        out_df = pd.concat([existing, out_df], ignore_index=True)
-    out_df.to_csv(path, index=False)
+    map_df.to_csv(path, index=False)
+    for line in changed:
+        print(f"Merchant map updated from sheet: {line}")
+    if added:
+        print(f"Merchant map: learned {len(added)} new merchant(s) from sheet")
 
 # Apply TF-IDF classifier to categorize transactions
 def apply_tfidf_classifier(
@@ -182,20 +279,15 @@ def apply_tfidf_classifier(
             history_df = pd.read_csv(history_file)
         except pd.errors.EmptyDataError:
             return df
-    if history_df.empty or name_col not in history_df.columns or category_col not in history_df.columns:
-        return df
-    
-    # history_df must have valid categories to train on
-    history_categories = history_df[category_col].fillna("").astype(str).str.strip()
-    history_valid = ~history_categories.str.lower().eq("uncategorized") & history_categories.ne("")
-    if not history_valid.any():
+    # Train only on trusted categories, so TF-IDF doesn't learn from its own past guesses
+    confirmed = confirmed_history(history_df, name_col, category_col)
+    if confirmed is None or confirmed.empty:
         return df
 
     # Prepare training data (past transactions with known categories)
-    # loc: select data by label (select only valid rows)
-    train_names = history_df.loc[history_valid, name_col].astype(str).map(_normalize_merchant)
-    train_names_raw = history_df.loc[history_valid, name_col].astype(str).tolist()
-    train_labels = history_df.loc[history_valid, category_col].astype(str).str.strip().tolist()
+    train_names = confirmed[name_col].astype(str).map(_normalize_merchant)
+    train_names_raw = confirmed[name_col].astype(str).tolist()
+    train_labels = confirmed[category_col].tolist()
 
     # For the target df, determine which rows need categorization
     out_df = df.copy()
